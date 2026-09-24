@@ -4,7 +4,7 @@ Pixel Video is a Claude Code skill for turning a topic, paper, or code repositor
 
 ## Video style references
 
-This skill's pixel-art video style was inspired by [videos from Dmytro Hrybov](https://x.com/dimentary) and [this video by Carlos Santana (DotCSV)](https://x.com/DotCSV/status/2102810407928819866). Thanks to both creators for the inspiration.
+This skill is a recreation based on [videos by Dmytro Hrybov](https://x.com/dimentary) and [this video by Carlos Santana (DotCSV)](https://x.com/DotCSV/status/2102810407928819866).
 
 ![Pixel-art widget gallery](examples/widgets_gallery.png)
 
