@@ -1,0 +1,557 @@
+#!/usr/bin/env python3
+"""pxv — one entry point for pixel-video work. Always call it by its absolute path
+(~/.claude/skills/pixel-video/pxv), never through a symlink.
+
+From a paper to a video:
+  pxv init   NAME [--paper PDF|arXiv-id|URL] [--code GIT_URL] [--style v2|v1] [--dir DIR]
+             → ./YYMMDD-NAME-pixel/ with paper/ (pdf, text, page thumbs, figures),
+               code/, FACTS.md, prep.py, scene.py, data/, out/
+  pxv stills SCENE[:Class] --times 0.5,2,4.5 [--out sheet.png] [--cols 4]
+  pxv still  SCENE[:Class] --t 5.0 [--full] [--out frame.png]                 (--full = final 1080p, bloom)
+  pxv check  SCENE[:Class] [--step 0.25]                                     (automatic QA, exit 1 on errors)
+  pxv render SCENE[:Class] [--out out/x.mp4] [--silent] [--lufs -24] [--t0 0 --t1 10] [--workers N]
+  pxv cover  SCENE[:Class] --t 12.5 [--title "…"] [--title34 "…"] [--byline "…"] [--crop34 x0,y0,x1,y1]
+             [--only 4x3,3x4]   (16:9 frame + 4:3 2400×1800 / 3:4 1800×2400 compositions)
+  pxv fig    paper/paper.pdf --page 3 --box x0,y0,x1,y1   (crop a vector figure at 300 dpi; box in the 60-dpi
+             page-thumbnail coords of paper/pages/)
+
+Other:
+  pxv new     v1|v2 NAME.py                      (bare scene template)
+  pxv sbs     REF.mp4 MINE.mp4 OUT.mp4 [--title T] [--left L] [--right R] [--audio mine|ref|none]
+  pxv analyze scale|lo|sheet|grid|palette|notes|motion|ocr|compare …   (reverse-engineer a reference)
+
+SCENE may omit ':Class' when the file defines exactly one Scene subclass.
+"""
+import argparse
+import importlib.util
+import inspect
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+SKILL = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SKILL)
+
+
+# ───────────────────────────────────────── scene loading
+def load_scene(spec, lang=None):
+    from pixelkit import Scene
+    path, _, cls = spec.partition(':')
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        sys.exit(f'✗ no such scene file: {path}')
+    sys.path.insert(0, os.path.dirname(path))
+    s = importlib.util.spec_from_file_location(os.path.splitext(os.path.basename(path))[0], path)
+    m = importlib.util.module_from_spec(s)
+    s.loader.exec_module(m)
+    if cls:
+        if not hasattr(m, cls):
+            sys.exit(f'✗ {path} has no class {cls}')
+        C = getattr(m, cls)
+    else:
+        found = [v for v in vars(m).values() if inspect.isclass(v) and issubclass(v, Scene) and v is not Scene
+                 and v.__module__ == m.__name__]
+        if len(found) != 1:
+            sys.exit(f'✗ {path}: say which scene with FILE:Class — found {[c.__name__ for c in found] or "none"}')
+        C = found[0]
+    for name in ('frame', 'frame_lo'):                  # the renderer calls these; a helper with the same name
+        if getattr(C, name) is not getattr(Scene, name):  # silently breaks still --full / render
+            sys.exit(f'✗ {C.__name__} overrides Scene.{name}() — that name is reserved (renderer); rename your method')
+    if lang:
+        C.LANG = lang
+    return C(), m
+
+
+def out_name(scene_spec, lang=None, t0=0.0, t1=None, suffix='.mp4'):
+    base = os.path.splitext(os.path.basename(scene_spec.split(':')[0]))[0]
+    if lang:
+        base += f'_{lang}'
+    if t0 or t1 is not None:
+        base += f'_{t0:g}-{t1:g}s' if t1 is not None else f'_{t0:g}s-'
+    return os.path.join('out', base + suffix)
+
+
+def ensure_dir(path):
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+
+
+# ───────────────────────────────────────── init: paper → project skeleton
+ARXIV = re.compile(r'(?:arxiv[:/ ]|arxiv\.org/(?:abs|pdf)/)?(\d{4}\.\d{4,5})(v\d+)?', re.I)
+
+
+def fetch_pdf(src, dst):
+    if os.path.exists(os.path.expanduser(src)):
+        shutil.copy(os.path.expanduser(src), dst)
+        return f'copied {src}'
+    m = ARXIV.search(src)
+    urls = []
+    if m and ('arxiv' in src.lower() or re.fullmatch(r'\d{4}\.\d{4,5}(v\d+)?', src.strip())):
+        aid = m.group(1) + (m.group(2) or '')
+        urls = [f'https://arxiv.org/pdf/{aid}', f'https://export.arxiv.org/pdf/{aid}']
+    elif src.startswith('http'):
+        urls = [src]
+    for u in urls:
+        r = subprocess.run(['curl', '-sL', '--max-time', '120', '-A', 'Mozilla/5.0', '-o', dst, u])
+        if r.returncode == 0 and os.path.exists(dst) and open(dst, 'rb').read(4) == b'%PDF':
+            return f'downloaded {u}'
+    if os.path.exists(dst):
+        os.remove(dst)
+    return None
+
+
+def cmd_init(a):
+    root = os.path.expanduser(a.root)
+    d = os.path.abspath(a.dir or os.path.join(root, f'{time.strftime("%y%m%d")}-{a.name}-pixel'))
+    if os.path.exists(os.path.join(d, 'scene.py')):
+        sys.exit(f'✗ {d} already has a scene.py — not overwriting')
+    for sub in ('paper', 'code', 'data', 'out'):
+        os.makedirs(os.path.join(d, sub), exist_ok=True)
+    notes = []
+    if a.paper:
+        pdf = os.path.join(d, 'paper', 'paper.pdf')
+        how = fetch_pdf(a.paper, pdf)
+        if not how:
+            notes.append(f'✗ could not get the paper from {a.paper!r} — put the PDF at paper/paper.pdf '
+                         f'(campus network may block the site; ask the user for the file)')
+        else:
+            notes.append(f'✓ paper: {how}')
+            subprocess.run(['pdftotext', '-layout', pdf, os.path.join(d, 'paper', 'paper.txt')])
+            os.makedirs(os.path.join(d, 'paper', 'pages'), exist_ok=True)
+            subprocess.run(['pdftoppm', '-r', '60', '-png', pdf, os.path.join(d, 'paper', 'pages', 'p')])
+            figs = os.path.join(d, 'paper', 'figs')
+            os.makedirs(figs, exist_ok=True)
+            subprocess.run(['pdfimages', '-png', pdf, os.path.join(figs, 'img')])
+            n_pages = len(os.listdir(os.path.join(d, 'paper', 'pages')))
+            n_figs = len([f for f in os.listdir(figs) if f.endswith(('.jpg', '.png'))]) if os.path.isdir(figs) else 0
+            notes.append(f'  paper/paper.txt, {n_pages} page thumbnails in paper/pages/, {n_figs} bitmaps in paper/figs/ '
+                         f'(vector figures are not extracted: pdftoppm -r 300 -f P -l P and crop)')
+    if a.code:
+        r = subprocess.run(['git', 'clone', '--depth', '1', a.code, os.path.join(d, 'code')],
+                           capture_output=True, text=True)
+        notes.append('✓ code cloned into code/' if r.returncode == 0 else f'✗ git clone failed: {r.stderr.strip()[:200]}')
+    for src, dst in ((f'scene_{a.style}.py', 'scene.py'), ('prep.py', 'prep.py'), ('FACTS.md', 'FACTS.md')):
+        t = open(os.path.join(SKILL, 'templates', src)).read().replace('{NAME}', a.name)
+        with open(os.path.join(d, dst), 'w') as f:
+            f.write(t)
+    print(f'✓ project: {d}')
+    for n in notes:
+        print('  ' + n)
+    print(f'''
+next (SKILL.md §0):
+  1. read paper/paper.txt (+ pages/, figs/, code/) → fill FACTS.md: every number with its source
+  2. pick ONE mechanism; write the stages in scene.py
+  3. python3 prep.py  → data/data.npz  (real numbers)
+  4. {SKILL}/pxv stills scene.py --times …   ·   pxv check scene.py
+  5. pxv render scene.py  ·  pxv cover scene.py --t …''')
+
+
+# ───────────────────────────────────────── check: automatic QA
+def cmd_check(a):
+    import numpy as np
+    from pixelkit import chrome, ensure_setup, fonts, pk
+    sc, mod = load_scene(a.scene, a.lang)
+    ensure_setup(sc)
+    lang = getattr(sc, 'LANG', 'en')
+    bg = np.asarray(sc.PAL['bg'], np.float32)
+    errors, warns = [], []
+    title = getattr(sc, 'TITLE', None) or getattr(mod, 'TITLE', None)
+    stages = getattr(sc, 'stages', None)
+    uses_chrome = isinstance(stages, chrome.Stages)
+    if uses_chrome:
+        for prob, txt in stages.check(title):
+            errors.append(f'copy · {prob}: {txt}')
+        if stages.stages[-1]['t'] > sc.DURATION - 1.0:
+            warns.append(f'last stage starts at {stages.stages[-1]["t"]} s, less than 1 s before the end')
+    # content-only renders: chrome off, text boxes recorded
+    boxes = []
+    orig_text = pk.Canvas.text
+    orig = (chrome.Stages.draw, chrome.header, chrome.caption, chrome.background)
+    draw_text = [True]
+
+    def rec_text(self, x, y, s, c, alpha=1.0, font=pk.FONT57, align='l', n=None, sub_dy=3, sub_color=None):
+        # every text call is recorded — also text drawn into a layer that is composited later
+        # (layers are how scenes reveal/dissolve groups, so most labels live in one)
+        w = self.text_width(s, font)
+        left = x - w // 2 if align == 'c' else (x - w + 1 if align == 'r' else x)
+        shown = s if n is None else s[:max(0, n)]
+        if shown.strip() and alpha > 0.3:
+            boxes.append((int(left), int(y), int(left + w - 1), int(y + font.height - 1), s))
+        if draw_text[0]:
+            return orig_text(self, x, y, s, c, alpha, font, align, n, sub_dy, sub_color)
+        return w
+    pk.Canvas.text = rec_text
+    chrome.Stages.draw = lambda *k, **kw: None
+    chrome.header = chrome.caption = chrome.background = lambda *k, **kw: None
+    fonts.MISSING.clear()
+    band_hits, edge_hits, tt_hits, tg_hits = [], [], [], []
+    rule_y = chrome.LAYOUT.get(lang, chrome.LAYOUT['en'])['rule_y']
+    prev, still_since, statics = None, 0.0, []
+    try:
+        ts = np.arange(0, sc.DURATION, a.step)
+        for t in ts:
+            boxes.clear()
+            draw_text[0] = True
+            full = sc.frame_lo(float(t))
+            # keep only text that actually shows in the final frame (a layer may be mid-dissolve or hidden)
+            vis = np.abs(full - bg).max(2) > 24
+            txt = []
+            for bx in boxes:
+                x0, y0, x1, y1 = max(0, bx[0]), max(0, bx[1]), min(sc.W - 1, bx[2]), min(sc.H - 1, bx[3])
+                if x1 > x0 and y1 > y0 and vis[y0:y1 + 1, x0:x1 + 1].mean() > 0.05:
+                    txt.append(bx)
+            draw_text[0] = False
+            boxes.clear()
+            gfx = sc.frame_lo(float(t))                       # same frame without text
+            diff = np.abs(full - bg).max(2) > 24
+            if uses_chrome:
+                top = diff[:18].any()
+                bot = diff[rule_y - 2:].any()
+                if top or bot:
+                    band_hits.append(t)
+            e = diff.copy()
+            e[2:-2, 2:-2] = False
+            if e.any():
+                edge_hits.append(t)
+            # text vs text
+            for i in range(len(txt)):
+                for j in range(i + 1, len(txt)):
+                    A, B = txt[i], txt[j]
+                    if A[:4] == B[:4]:
+                        continue
+                    ox = min(A[2], B[2]) - max(A[0], B[0]) + 1
+                    oy = min(A[3], B[3]) - max(A[1], B[1]) + 1
+                    if ox > 1 and oy > 2:
+                        tt_hits.append((t, A[4], B[4]))
+            # text over busy graphics (skipped during the 0.3 s checker-ghost boot, which is busy by design)
+            gd = np.abs(gfx - bg).max(2) > 24
+            for (x0, y0, x1, y1, s) in (txt if t >= 0.35 else []):
+                x0c, y0c, x1c, y1c = max(0, x0), max(0, y0), min(sc.W - 1, x1), min(sc.H - 1, y1)
+                if x1c <= x0c or y1c <= y0c:
+                    continue
+                reg = gfx[y0c:y1c + 1, x0c:x1c + 1]
+                med = np.median(reg.reshape(-1, 3), 0)
+                busy = (np.abs(reg - med).max(2) > 30) & gd[y0c:y1c + 1, x0c:x1c + 1]
+                if busy.mean() > 0.12:
+                    tg_hits.append((t, s))
+            sig = np.abs(full).sum()
+            if prev is not None and abs(sig - prev) < 1e-3:
+                if t - still_since >= 3.0 and t < sc.DURATION - 2.5:
+                    statics.append(round(still_since, 2))
+            else:
+                still_since = t
+            prev = sig
+    finally:
+        pk.Canvas.text = orig_text
+        chrome.Stages.draw, chrome.header, chrome.caption, chrome.background = orig
+
+    def spans(ts_):
+        if not ts_:
+            return ''
+        out, s0, p = [], ts_[0], ts_[0]
+        for x in ts_[1:]:
+            if x - p > a.step * 1.5:
+                out.append((s0, p))
+                s0 = x
+            p = x
+        out.append((s0, p))
+        return ', '.join(f'{u:.2f}–{v:.2f}s' if v > u else f'{u:.2f}s' for u, v in out)
+    if fonts.MISSING:
+        errors.append(f'glyphs drawn as "?" (font lacks them): {sorted(fonts.MISSING)} — change the text')
+    if band_hits:
+        errors.append(f'content inside the header band (y<18) or caption band (y≥{rule_y - 2}): {spans(band_hits)}')
+    if edge_hits:
+        warns.append(f'content within 2 px of the frame edge: {spans(edge_hits)}')
+    if tt_hits:
+        seen = {}
+        for t, x, y in tt_hits:
+            seen.setdefault((x, y), t)
+        for (x, y), t in list(seen.items())[:12]:
+            errors.append(f'text overlaps text at {t:.2f}s: {x!r} × {y!r}')
+    if tg_hits:
+        seen = {}
+        for t, s in tg_hits:
+            seen.setdefault(s, t)
+        for s, t in list(seen.items())[:12]:
+            warns.append(f'text over busy graphics at {t:.2f}s: {s!r}')
+    for s0 in statics:
+        warns.append(f'nothing moves for ≥3 s from {s0:.2f}s (dead air?)')
+    if getattr(sc, 'LOOP', False):
+        d = float(np.abs(sc.frame_lo(0.0) - sc.frame_lo(sc.DURATION - 1 / sc.FPS)).mean())
+        (warns if d > 2 else []).append(f'loop seam: first vs last frame differ by {d:.1f}/255 on average')
+    print(f'pxv check {a.scene}  lang={lang}  {sc.DURATION:g}s  sampled every {a.step}s')
+    for e in errors:
+        print('  ✗ ' + e)
+    for w in warns:
+        print('  ! ' + w)
+    if not errors and not warns:
+        print('  ✓ clean')
+    sys.exit(1 if errors else 0)
+
+
+# ───────────────────────────────────────── cover: 16:9 frame + 4:3 / 3:4 pixel compositions
+def big_text(cv, x, y, s, color, font, k=2, align='l'):
+    import numpy as np
+    from pixelkit import Canvas
+    w = cv.text_width(s, font)
+    tmp = Canvas(w + 2, font.height + 4, (0, 0, 0), layer=True)
+    tmp.text(1, 1, s, color, font=font)
+    rgb = np.repeat(np.repeat(tmp.a, k, 0), k, 1)
+    m = np.repeat(np.repeat(tmp.m, k, 0), k, 1)
+    W = rgb.shape[1]
+    x0 = x - W // 2 if align == 'c' else x
+    cv.blit(rgb, x0, y, 1.0, m)
+    return rgb.shape[0]
+
+
+def wrap(s, font, width, cv):
+    """Wrap English text at spaces to fit the cover."""
+    lines, cur = [], ''
+    for word in s.split(' '):
+        nxt = (cur + ' ' + word) if cur else word
+        if cv.text_width(nxt, font) <= width or not cur:
+            cur = nxt
+        else:
+            lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def wrap_byline(s, font, width, cv):
+    """Wrap at ' · ' separators first (never split 'Microsoft Corporation'), then by words."""
+    lines, cur = [], ''
+    for part in (s or '').split(' · '):
+        nxt = cur + ' · ' + part if cur else part
+        if cv.text_width(nxt, font) <= width:
+            cur = nxt
+            continue
+        if cur:
+            lines.append(cur)
+        if cv.text_width(part, font) <= width:
+            cur = part
+        else:
+            sub = wrap(part, font, width, cv)
+            lines += sub[:-1]
+            cur = sub[-1]
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def cmd_cover(a):
+    """Covers: 16:9 = the final frame at t; 4:3 (2400×1800) and 3:4 (1800×2400) = the frame's CONTENT (chrome
+    bands cropped, or --crop / --crop34) on the pixel grid, a big pixel title and a byline. The layout search
+    guarantees title, picture and byline never overlap and prefers the largest on-screen picture."""
+    import numpy as np
+    from PIL import Image
+    from pixelkit import Canvas, bloom, dot_grid, ensure_setup, upscale
+    from pixelkit import chrome as ch
+    from pixelkit.fonts import FONT57
+    sc, mod = load_scene(a.scene, a.lang)
+    ensure_setup(sc)
+    base = os.path.splitext(os.path.basename(a.scene.split(':')[0]))[0] + (f'_{a.lang}' if a.lang else '')
+    os.makedirs('out', exist_ok=True)
+    only = set((a.only or '16x9,4x3,3x4').split(','))
+    if '16x9' in only:
+        Image.fromarray(sc.frame(a.t)).save(f'out/{base}_cover_16x9.png')
+        print(f'✓ out/{base}_cover_16x9.png (1920×1080)')
+    full_lo = sc.frame_lo(a.t)
+    lo = full_lo
+    pal = sc.PAL
+    bg = np.asarray(pal['bg'], np.float32)
+    if isinstance(getattr(sc, 'stages', None), ch.Stages):     # drop the header / caption bands
+        lo = lo[18:ch.LAYOUT[getattr(sc, 'LANG', 'en')]['rule_y'] - 3]
+    ink = np.abs(lo - bg).max(2) > 24
+    ys, xs = np.nonzero(ink)
+    if len(xs):
+        m = 6
+        lo = lo[max(0, ys.min() - m):ys.max() + m + 1, max(0, xs.min() - m):xs.max() + m + 1]
+    meas = Canvas(1, 1)
+    default_title = a.title or getattr(sc, 'TITLE', None) or getattr(mod, 'TITLE', '') or ''
+    bfont = FONT57
+    for tw, th, tag in ((2400, 1800, '4x3'), (1800, 2400, '3x4')):
+        if tag not in only:
+            continue
+        title = (a.title34 if (tag == '3x4' and a.title34) else default_title)
+        tfont = FONT57
+        spec = a.crop34 if (tag == '3x4' and a.crop34) else a.crop
+        if spec:
+            x0, y0, x1, y1 = (int(v) for v in spec.split(','))
+            src = full_lo[max(0, y0):y1, max(0, x0):x1]
+        else:
+            src = lo
+        best = None
+        for k in (8, 6, 5, 4, 3, 2, 1):                        # exact divisors of 2400 / 1800
+            Wc, Hc = tw // k, th // k
+            by = wrap_byline(a.byline, bfont, Wc - 16, meas)[:3] if a.byline else []
+            by_h = (bfont.height + 4) * len(by) + (10 if by else 4)
+            for s_t in (6, 5, 4, 3, 2):
+                lines = wrap(title, tfont, (Wc - 16) // s_t, meas) if title else []
+                if len(lines) > (2 if s_t >= 3 else 3):
+                    continue
+                title_h = 12 + sum(tfont.height * s_t + s_t * 2 for _ in lines)
+                room_w, room_h = Wc - 4, Hc - title_h - 6 - by_h
+                if src.shape[1] > room_w or src.shape[0] > room_h:
+                    continue
+                z = min(room_w // src.shape[1], room_h // src.shape[0])
+                score = (k * z, s_t * k)                       # biggest picture on screen, then biggest title
+                if best is None or score > best[0]:
+                    best = (score, k, s_t, z, lines, by, title_h, by_h)
+        if best is None:
+            sys.exit(f'✗ {tag}: the picture ({src.shape[1]}×{src.shape[0]} canvas px) does not fit with this title '
+                     f'— shorten --title{"34" if tag == "3x4" else ""} or pass --crop{"34" if tag == "3x4" else ""}')
+        _, k, s_t, z, lines, by, title_h, by_h = best
+        Wc, Hc = tw // k, th // k
+        cv = Canvas(Wc, Hc, pal['bg'])
+        if 'grid' in pal:
+            dot_grid(cv, pal['grid'], step=6, ox=3, oy=3)
+        y = 12
+        for line in lines:
+            y += big_text(cv, Wc // 2, y, line, pal.get('text', (240, 240, 248)), tfont, k=s_t, align='c') + s_t * 2
+        pic = np.repeat(np.repeat(src, z, 0), z, 1)
+        room_h = Hc - title_h - 6 - by_h
+        px, py = (Wc - pic.shape[1]) // 2, title_h + 6 + (room_h - pic.shape[0]) // 2
+        cv.blit(pic, px, py)
+        yy = Hc - by_h + 6
+        for line in by:
+            cv.text(Wc // 2, yy, line, pal.get('label', (114, 121, 160)), font=bfont, align='c')
+            yy += bfont.height + 4
+        img = bloom(cv.a, k, pal['bg'], **sc.BLOOM) if sc.BLOOM else upscale(cv.a, k)
+        path = f'out/{base}_cover_{tag}.png'
+        Image.fromarray(img).save(path)
+        print(f'✓ {path} ({img.shape[1]}×{img.shape[0]}; picture ×{k * z} on screen, title ×{s_t * k})')
+
+
+def cmd_fig(a):
+    """Crop a (vector) figure out of a PDF page at high resolution. --box is in the coordinates of the
+    60-dpi page thumbnails pxv init writes to paper/pages/ (read them off the thumbnail)."""
+    import glob
+    import tempfile
+    from PIL import Image
+    tmp = tempfile.mkdtemp()
+    subprocess.run(['pdftoppm', '-r', str(a.dpi), '-f', str(a.page), '-l', str(a.page), '-png', a.pdf,
+                    os.path.join(tmp, 'p')], check=True)
+    im = Image.open(sorted(glob.glob(os.path.join(tmp, 'p*.png')))[0])
+    if a.box:
+        x0, y0, x1, y1 = (float(v) for v in a.box.split(','))
+        s = a.dpi / a.thumb_dpi
+        im = im.crop((int(x0 * s), int(y0 * s), int(x1 * s), int(y1 * s)))
+    out = a.out or os.path.join(os.path.dirname(os.path.abspath(a.pdf)), 'figs', f'page{a.page}'
+                                + (('_' + a.box.replace(',', '-')) if a.box else '') + '.png')
+    ensure_dir(out)
+    im.save(out)
+    print(f'✓ {out} ({im.width}×{im.height}) → pixelate(PIL.Image.open(…), w, h, …) to use it in a scene')
+
+
+# ───────────────────────────────────────── main
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'analyze':
+        sys.exit(subprocess.call([sys.executable, os.path.join(SKILL, 'tools', 'analyze.py')] + sys.argv[2:]))
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest='cmd', required=True)
+    p = sp.add_parser('init')
+    p.add_argument('name'); p.add_argument('--paper'); p.add_argument('--code')
+    p.add_argument('--style', default='v2', choices=['v1', 'v2']); p.add_argument('--dir')
+    p.add_argument('--root', default='.', help='parent directory for the generated project (default: current directory)')
+    p = sp.add_parser('new'); p.add_argument('kind', choices=['v1', 'v2']); p.add_argument('name')
+    p = sp.add_parser('stills')
+    p.add_argument('scene'); p.add_argument('--times', required=True); p.add_argument('--out')
+    p.add_argument('--cols', type=int, default=4); p.add_argument('--lang', choices=['en'])
+    p = sp.add_parser('still')
+    p.add_argument('scene'); p.add_argument('--t', type=float, required=True); p.add_argument('--full', action='store_true')
+    p.add_argument('--out'); p.add_argument('--lang', choices=['en'])
+    p = sp.add_parser('check')
+    p.add_argument('scene'); p.add_argument('--lang', choices=['en']); p.add_argument('--step', type=float, default=0.25)
+    p = sp.add_parser('render')
+    p.add_argument('scene'); p.add_argument('--out'); p.add_argument('--silent', action='store_true')
+    p.add_argument('--lufs', type=float, default=-24.0); p.add_argument('--t0', type=float, default=0.0)
+    p.add_argument('--t1', type=float); p.add_argument('--lang', choices=['en']); p.add_argument('--workers', type=int)
+    p.add_argument('--force', action='store_true', help='render even if the copy check fails')
+    p = sp.add_parser('cover')
+    p.add_argument('scene'); p.add_argument('--t', type=float, required=True); p.add_argument('--title')
+    p.add_argument('--byline'); p.add_argument('--lang', choices=['en'])
+    p.add_argument('--crop', help='x0,y0,x1,y1 in canvas px: the part of the frame to feature (both covers)')
+    p.add_argument('--crop34', help='same, for the portrait 3:4 cover only (pick the key detail; it gets ×2)')
+    p.add_argument('--title34', help='a shorter title for the portrait cover')
+    p.add_argument('--only', help='which covers to (re)make: any of 16x9,4x3,3x4 (default all)')
+    p = sp.add_parser('fig')
+    p.add_argument('pdf'); p.add_argument('--page', type=int, required=True); p.add_argument('--box')
+    p.add_argument('--dpi', type=int, default=300); p.add_argument('--thumb-dpi', dest='thumb_dpi', type=int, default=60)
+    p.add_argument('--out')
+    p = sp.add_parser('sbs')
+    p.add_argument('ref'); p.add_argument('mine'); p.add_argument('out')
+    p.add_argument('--title', default='REFERENCE  VS  REPLICA'); p.add_argument('--left', default='REFERENCE')
+    p.add_argument('--right', default='PIXELKIT REPLICA'); p.add_argument('--audio', default='mine',
+                                                                           choices=['mine', 'ref', 'none'])
+    a = ap.parse_args()
+
+    if a.cmd == 'init':
+        return cmd_init(a)
+    if a.cmd == 'new':
+        if os.path.exists(a.name):
+            sys.exit(f'✗ {a.name} exists — not overwriting')
+        t = open(os.path.join(SKILL, 'templates', f'scene_{a.kind}.py')).read().replace('{NAME}', os.path.splitext(
+            os.path.basename(a.name))[0])
+        ensure_dir(a.name)
+        with open(a.name, 'w') as f:
+            f.write(t)
+        print(f'✓ {a.name}')
+        return
+    if a.cmd == 'sbs':
+        from pixelkit import sidebyside
+        sys.argv = ['sidebyside', a.ref, a.mine, a.out, '--title', a.title, '--left', a.left, '--right', a.right,
+                    '--audio', a.audio]
+        return sidebyside.main()
+    if a.cmd == 'check':
+        return cmd_check(a)
+    if a.cmd == 'cover':
+        return cmd_cover(a)
+    if a.cmd == 'fig':
+        return cmd_fig(a)
+
+    from pixelkit import chrome, ensure_setup, frame_range, render, sfx, still, stills
+    sc, mod = load_scene(a.scene, a.lang)
+    if a.cmd == 'stills':
+        out = a.out or out_name(a.scene, a.lang, suffix='_stills.png')
+        ensure_dir(out)
+        stills(sc, [float(x) for x in a.times.split(',')], out, cols=a.cols)
+        print('✓', out)
+    elif a.cmd == 'still':
+        out = a.out or out_name(a.scene, a.lang, suffix=f'_{a.t:.2f}{"_full" if a.full else ""}.png')
+        ensure_dir(out)
+        still(sc, a.t, out, full=a.full)
+        print('✓', out)
+    elif a.cmd == 'render':
+        ensure_setup(sc)
+        stg = getattr(sc, 'stages', None)
+        if isinstance(stg, chrome.Stages) and not a.force:   # never spend a render on copy that does not fit
+            bad = stg.check(getattr(sc, 'TITLE', None) or getattr(mod, 'TITLE', None))
+            if bad:
+                for prob, txt in bad:
+                    print(f'  ✗ copy · {prob}: {txt}')
+                sys.exit('✗ fix the copy first (`pxv check` lists everything), or pass --force')
+        f0, f1 = frame_range(sc, a.t0, a.t1)
+        partial = f0 > 0 or f1 < int(round(sc.DURATION * sc.FPS))
+        # the default name reflects the range actually rendered (a --t1 past the end is the full video)
+        out = a.out or (out_name(a.scene, a.lang, f0 / sc.FPS, f1 / sc.FPS) if partial else out_name(a.scene, a.lang))
+        ensure_dir(out)
+        wav = None
+        if not a.silent and not partial:            # partial renders are silent (events would misalign)
+            ev = sc.sfx()
+            if ev:
+                tr = sfx.Track((f1 - f0) / sc.FPS)
+                for e in ev:
+                    ts, snd, g = e if len(e) == 3 else (e[0], e[1], 1.0)
+                    tr.add(ts, snd, g)
+                wav = os.path.splitext(out)[0] + '.wav'
+                tr.save(wav, lufs=a.lufs)
+        render(sc, out, t0=a.t0, t1=a.t1, audio=wav, workers=a.workers)
+
+
+if __name__ == '__main__':
+    main()
